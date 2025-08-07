@@ -13,7 +13,7 @@ Controls:
 """
 
 DRONE_SPEED = 100
-DISPLAY_FPS = 60
+DISPLAY_FPS = 30
 WINDOW_SIZE = (960, 720)
 STICK_DEADZONE = 0.05
 
@@ -23,7 +23,10 @@ class TelloDroneController:
         pygame.init()
         pygame.joystick.init()
         pygame.display.set_caption("Tello Drone Controller")
-        self.screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
+        self.clock = pygame.time.Clock()
+        self.screen = pygame.display.set_mode(
+            WINDOW_SIZE, pygame.RESIZABLE | pygame.DOUBLEBUF
+        )
 
         self.drone = Tello()
         self.frame_reader = None
@@ -56,6 +59,8 @@ class TelloDroneController:
 
         self.stop_threads = threading.Event()
         pygame.time.set_timer(pygame.USEREVENT + 1, 1000 // DISPLAY_FPS)
+
+        self.control_update_counter = 0
 
     def apply_deadzone(self, value, deadzone=STICK_DEADZONE):
         """Apply deadzone to controller input."""
@@ -117,8 +122,8 @@ class TelloDroneController:
         while running:
             running = self.handle_events()
             self.render_frame()
-            pygame.display.update()
-            pygame.time.wait(1000 // DISPLAY_FPS)
+            pygame.display.flip()
+            self.clock.tick(DISPLAY_FPS)
         self.cleanup()
 
     def handle_events(self):
@@ -128,7 +133,12 @@ class TelloDroneController:
                 if self.controller:
                     self.update_controller_input()
                     self.handle_controller_buttons()
-                self.update_drone_controls()
+
+                # Only update drone controls every 3rd frame (10Hz if DISPLAY_FPS=30)
+                self.control_update_counter += 1
+                if self.control_update_counter >= 3:
+                    self.update_drone_controls()
+                    self.control_update_counter = 0
             elif event.type == pygame.QUIT:
                 return False
         return True
@@ -138,9 +148,23 @@ class TelloDroneController:
         self.screen.fill([0, 0, 0])
         if self.frame_reader:
             frame = self.frame_reader.frame
-            frame_rgb = np.rot90(np.flipud(frame[:, :, :]))
+            frame_rgb = np.flipud(np.rot90(frame[:, :, :]))
             frame_surface = pygame.surfarray.make_surface(frame_rgb)
-            self.screen.blit(frame_surface, (0, 0))
+
+            # Get window size
+            win_w, win_h = self.screen.get_size()
+            # Get frame size
+            frame_h, frame_w = frame.shape[:2]
+            # Calculate scale to fit window while keeping aspect ratio
+            scale = min(win_w / frame_w, win_h / frame_h)
+            new_w = int(frame_w * scale)
+            new_h = int(frame_h * scale)
+            # Scale the frame
+            scaled_surface = pygame.transform.smoothscale(frame_surface, (new_w, new_h))
+            # Center the frame
+            x = (win_w - new_w) // 2
+            y = (win_h - new_h) // 2
+            self.screen.blit(scaled_surface, (x, y))
         self.draw_telemetry_overlay_pygame()
 
     def cleanup(self):
@@ -153,7 +177,7 @@ class TelloDroneController:
             self.drone_connection_thread,
         ]:
             if thread and thread.is_alive():
-                thread.join(timeout=1)
+                thread.join()
         pygame.quit()
 
     def start_background_threads(self):
@@ -182,8 +206,11 @@ class TelloDroneController:
         """Background thread to connect to the drone and set up video stream."""
         print("Drone connection thread started")
         connected = False
-        while not self.stop_threads.is_set() and not connected:
+        while not self.stop_threads.is_set():
             try:
+                if connected:
+                    time.sleep(0.5)
+                    continue
                 self.drone.connect()
                 self.drone.set_speed(DRONE_SPEED)
                 self.drone.streamoff()
@@ -193,7 +220,6 @@ class TelloDroneController:
                 connected = True
             except Exception as e:
                 print(f"Drone connection failed: {e}. Retrying...")
-                time.sleep(0.5)
 
         if connected:
             self.drone.streamoff()
@@ -228,10 +254,13 @@ class TelloDroneController:
                 temperature = self.drone.get_temperature()
                 flight_time = self.drone.get_flight_time()
 
-                speed_x = self.drone.get_speed_x()
-                speed_y = self.drone.get_speed_y()
-                speed_z = self.drone.get_speed_z()
-                total_speed = (speed_x**2 + speed_y**2 + speed_z**2) ** 0.5
+                try:
+                    speed_x = self.drone.get_speed_x()
+                    speed_y = self.drone.get_speed_y()
+                    speed_z = self.drone.get_speed_z()
+                    total_speed = (speed_x**2 + speed_y**2 + speed_z**2) ** 0.5
+                except:
+                    total_speed = 0
 
                 with self.telemetry_lock:
                     self.telemetry_cache.update(
@@ -295,8 +324,10 @@ class TelloDroneController:
 
     def draw_telemetry_overlay_pygame(self):
         """Draw telemetry overlay using pygame fonts."""
-        font_medium = pygame.font.Font("DejaVuSansMono-Bold.ttf", 20)
-        font_status = pygame.font.Font("DejaVuSansMono-Bold.ttf", 60)
+        win_w, win_h = self.screen.get_size()  # Get current window size
+
+        font_medium = pygame.font.Font("DejaVuSansMono-Bold.ttf", max(16, win_h // 36))
+        font_status = pygame.font.Font("DejaVuSansMono-Bold.ttf", max(40, win_h // 12))
 
         with self.telemetry_lock:
             telemetry = self.telemetry_cache.copy()
@@ -313,66 +344,61 @@ class TelloDroneController:
         temp_text = font_medium.render(
             f"{telemetry['temperature']:.1f}°C", True, (255, 255, 255)
         )
-        temp_rect = temp_text.get_rect(center=(WINDOW_SIZE[0] // 2, 25))
+        temp_rect = temp_text.get_rect(center=(win_w // 2, 25))
         self.screen.blit(temp_text, temp_rect)
 
         battery_level = telemetry["battery"]
         battery_color = (255, 0, 0) if battery_level < 30 else (255, 255, 255)
         battery_text = font_medium.render(f"{battery_level}%", True, battery_color)
-        battery_rect = battery_text.get_rect(topright=(WINDOW_SIZE[0] - 10, 10))
+        battery_rect = battery_text.get_rect(topright=(win_w - 10, 10))
         self.screen.blit(battery_text, battery_rect)
 
         # Bottom left
-        y_offset = WINDOW_SIZE[1] - 80
+        line_spacing = int(win_h * 0.045)  # Increased spacing, scales with window
+        y_offset = win_h - (line_spacing * 2)
         controller_text = (
             f"{'Connected' if self.controller else 'Controller Disconnected'}"
         )
         controller_color = (0, 255, 0) if self.controller else (255, 0, 0)
         controller_surface = font_medium.render(controller_text, True, controller_color)
         self.screen.blit(controller_surface, (10, y_offset))
-        y_offset += 30
+        y_offset += line_spacing
 
         controls_text = f"P:{self.forward_back_input:+3} R:{self.left_right_input:+3} T:{self.up_down_input:+3} Y:{self.yaw_input:+3}"
         controls_surface = font_medium.render(controls_text, True, (255, 255, 255))
         self.screen.blit(controls_surface, (10, y_offset))
 
         # Bottom right
-        y_offset_br = WINDOW_SIZE[1] - 80
+        y_offset_br = win_h - (line_spacing * 2)
         height_text = font_medium.render(
             f"{telemetry['height']/100} m", True, (255, 255, 255)
         )
-        height_rect = height_text.get_rect(topright=(WINDOW_SIZE[0] - 10, y_offset_br))
+        height_rect = height_text.get_rect(topright=(win_w - 10, y_offset_br))
         self.screen.blit(height_text, height_rect)
-        y_offset_br += 30
+        y_offset_br += line_spacing
 
         speed_text = font_medium.render(
             f"{telemetry['total_speed']:.1f} cm/s",
             True,
             (255, 255, 255),
         )
-        speed_rect = speed_text.get_rect(topright=(WINDOW_SIZE[0] - 10, y_offset_br))
+        speed_rect = speed_text.get_rect(topright=(win_w - 10, y_offset_br))
         self.screen.blit(speed_text, speed_rect)
 
         # Center overlays
         if self.emergency_triggered:
             emergency_text = font_status.render("EMERGENCY STOP", True, (255, 0, 0))
-            rect = emergency_text.get_rect(
-                center=(WINDOW_SIZE[0] // 2, WINDOW_SIZE[1] // 2 - 90)
-            )
+            rect = emergency_text.get_rect(center=(win_w // 2, win_h // 2 - 90))
             self.screen.blit(emergency_text, rect)
 
         if self.takeoff_triggered:
             takeoff_text = font_status.render("TAKEOFF", True, (255, 255, 255))
-            rect = takeoff_text.get_rect(
-                center=(WINDOW_SIZE[0] // 2, WINDOW_SIZE[1] // 2 - 30)
-            )
+            rect = takeoff_text.get_rect(center=(win_w // 2, win_h // 2 - 30))
             self.screen.blit(takeoff_text, rect)
 
         if self.land_triggered:
             land_text = font_status.render("LAND", True, (255, 255, 255))
-            rect = land_text.get_rect(
-                center=(WINDOW_SIZE[0] // 2, WINDOW_SIZE[1] // 2 + 90)
-            )
+            rect = land_text.get_rect(center=(win_w // 2, win_h // 2 + 90))
             self.screen.blit(land_text, rect)
 
     def update_drone_controls(self):
@@ -385,4 +411,11 @@ class TelloDroneController:
         )
 
 
-if __name__ ==
+if __name__ == "__main__":
+    controller = TelloDroneController()
+    try:
+        controller.run()
+    except KeyboardInterrupt:
+        print("Exiting...")
+    finally:
+        controller.cleanup()
