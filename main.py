@@ -15,7 +15,7 @@ Controls:
 DRONE_SPEED = 100
 DISPLAY_FPS = 30
 WINDOW_SIZE = (960, 720)
-STICK_DEADZONE = 0.05
+STICK_DEADZONE = 0.1
 
 
 class TelloDroneController:
@@ -50,7 +50,9 @@ class TelloDroneController:
         self.emergency_triggered = False
         self.takeoff_triggered = False
         self.land_triggered = False
-        self.blocking_command_queue = queue.Queue()
+        self.blocking_command_queue = queue.Queue(
+            1
+        )  # Limit to 1 command when pressing the button
 
         self.blocking_command_thread = None
         self.controller_connection_thread = None
@@ -165,6 +167,8 @@ class TelloDroneController:
             x = (win_w - new_w) // 2
             y = (win_h - new_h) // 2
             self.screen.blit(scaled_surface, (x, y))
+
+        # Want to see the overlay even if no frame is available
         self.draw_telemetry_overlay_pygame()
 
     def cleanup(self):
@@ -177,7 +181,7 @@ class TelloDroneController:
             self.drone_connection_thread,
         ]:
             if thread and thread.is_alive():
-                thread.join()
+                thread.join(timeout=1)
         pygame.quit()
 
     def start_background_threads(self):
@@ -222,8 +226,11 @@ class TelloDroneController:
                 print(f"Drone connection failed: {e}. Retrying...")
 
         if connected:
-            self.drone.streamoff()
-            self.drone.end()
+            try:
+                self.drone.streamoff()
+                self.drone.end()
+            except Exception as e:
+                print(f"Error during drone cleanup: {e}")
 
         print("Drone connection thread stopped")
 
@@ -234,6 +241,8 @@ class TelloDroneController:
         while not self.stop_threads.is_set():
             if not self.controller and pygame.joystick.get_count() > 0:
                 try:
+                    # Can have problems if immediately start taking inputs
+                    time.sleep(0.5)
                     self.controller = pygame.joystick.Joystick(0)
                     self.controller.init()
                     print(f"Controller connected: {self.controller.get_name()}")
@@ -254,13 +263,10 @@ class TelloDroneController:
                 temperature = self.drone.get_temperature()
                 flight_time = self.drone.get_flight_time()
 
-                try:
-                    speed_x = self.drone.get_speed_x()
-                    speed_y = self.drone.get_speed_y()
-                    speed_z = self.drone.get_speed_z()
-                    total_speed = (speed_x**2 + speed_y**2 + speed_z**2) ** 0.5
-                except:
-                    total_speed = 0
+                speed_x = self.drone.get_speed_x()
+                speed_y = self.drone.get_speed_y()
+                speed_z = self.drone.get_speed_z()
+                total_speed = (speed_x**2 + speed_y**2 + speed_z**2) ** 0.5
 
                 with self.telemetry_lock:
                     self.telemetry_cache.update(
@@ -274,7 +280,9 @@ class TelloDroneController:
                     )
             except Exception as e:
                 print(f"Telemetry update error: {e}")
+
             time.sleep(0.5)
+
         print("Telemetry thread stopped")
 
     def blocking_command_worker(self):
@@ -305,7 +313,8 @@ class TelloDroneController:
             print("Takeoff completed!")
         except Exception as e:
             print(f"Takeoff failed: {e}")
-        self.takeoff_triggered = False
+        finally:
+            self.takeoff_triggered = False
 
     def _execute_land(self):
         """Execute landing in command thread."""
@@ -315,12 +324,16 @@ class TelloDroneController:
             print("Landing completed!")
         except Exception as e:
             print(f"Landing failed: {e}")
-        self.land_triggered = False
+        finally:
+            self.land_triggered = False
 
-    def queue_command(self, command_type, **kwargs):
-        """Queue a command for execution in the command thread."""
-        command = {"type": command_type, **kwargs}
-        self.blocking_command_queue.put(command)
+    def queue_command(self, command_type):
+        """Queue a command for execution in the blocking command thread."""
+        command = {"type": command_type}
+        try:
+            self.blocking_command_queue.put_nowait(command)
+        except queue.Full:
+            return
 
     def draw_telemetry_overlay_pygame(self):
         """Draw telemetry overlay using pygame fonts."""
@@ -388,12 +401,12 @@ class TelloDroneController:
         # Center overlays
         if self.emergency_triggered:
             emergency_text = font_status.render("EMERGENCY STOP", True, (255, 0, 0))
-            rect = emergency_text.get_rect(center=(win_w // 2, win_h // 2 - 90))
+            rect = emergency_text.get_rect(center=(win_w // 2, win_h // 2))
             self.screen.blit(emergency_text, rect)
 
         if self.takeoff_triggered:
             takeoff_text = font_status.render("TAKEOFF", True, (255, 255, 255))
-            rect = takeoff_text.get_rect(center=(win_w // 2, win_h // 2 - 30))
+            rect = takeoff_text.get_rect(center=(win_w // 2, win_h // 2 - 90))
             self.screen.blit(takeoff_text, rect)
 
         if self.land_triggered:
