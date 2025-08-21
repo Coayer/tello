@@ -4,6 +4,10 @@ import pygame
 import numpy as np
 import queue
 import time
+from google import genai
+from google.genai import types
+import os
+import cv2
 
 """
 Controls:
@@ -16,6 +20,7 @@ DRONE_SPEED = 100
 DISPLAY_FPS = 30
 WINDOW_SIZE = (960, 720)
 STICK_DEADZONE = 0.1
+MOVEMENT_DISTANCE = 50
 
 
 class TelloDroneController:
@@ -48,8 +53,6 @@ class TelloDroneController:
         }
 
         self.emergency_triggered = False
-        self.takeoff_triggered = False
-        self.land_triggered = False
         self.blocking_command_queue = queue.Queue(
             1
         )  # Limit to 1 command when pressing the button
@@ -58,6 +61,7 @@ class TelloDroneController:
         self.controller_connection_thread = None
         self.telemetry_thread = None
         self.drone_connection_thread = None
+        self.autopilot_worker_thread = None
 
         self.stop_threads = threading.Event()
         pygame.time.set_timer(pygame.USEREVENT + 1, 1000 // DISPLAY_FPS)
@@ -100,16 +104,36 @@ class TelloDroneController:
         if not self.controller:
             return
         try:
-            if self.controller.get_button(2):
-                self.queue_command("takeoff")
-                self.takeoff_triggered = True
+            if self.controller.get_button(5):
+                self.queue_command(self.drone.takeoff)
 
-            if self.controller.get_button(1):
-                self.queue_command("land")
-                self.land_triggered = True
+            elif self.controller.get_button(4):
+                self.queue_command(self.drone.land)
 
-            if self.controller.get_button(8):
+            elif self.controller.get_hat(0) == (0, 1):
+                self.queue_command(self.drone.move_forward(MOVEMENT_DISTANCE))
+
+            elif self.controller.get_hat(0) == (0, -1):
+                self.queue_command(self.drone.move_back(MOVEMENT_DISTANCE))
+
+            elif self.controller.get_hat(0) == (-1, 0):
+                self.queue_command(self.drone.move_left(MOVEMENT_DISTANCE))
+
+            elif self.controller.get_hat(0) == (1, 0):
+                self.queue_command(self.drone.move_right(MOVEMENT_DISTANCE))
+
+            elif self.controller.get_button(2):
+                self.autopilot_worker_thread = threading.Thread(
+                    target=self.autopilot_worker, daemon=True
+                )
+                self.autopilot_worker_thread.start()
+
+            elif self.controller.get_button(8) or self.controller.get_button(10):
                 self.drone.emergency()
+                try:
+                    self.blocking_command_queue.get_nowait()  # Stop it trying to takeoff again if it was queued
+                except queue.Empty:
+                    pass
                 self.emergency_triggered = True
                 self.forward_back_input = 0
                 self.left_right_input = 0
@@ -206,6 +230,83 @@ class TelloDroneController:
 
         print("Background threads started")
 
+    def move(self):
+        print("hi")
+
+    def autopilot_worker(self):
+        client = genai.Client(
+            api_key=os.environ.get("GEMINI_API_KEY"),
+        )
+
+        model = "gemini-2.5-flash"
+        tools = []
+        generate_content_config = types.GenerateContentConfig(
+            tools=tools,
+            thinking_config=types.ThinkingConfig(
+                thinking_budget=0,
+            ),
+        )
+        if self.frame_reader:
+            frame = self.frame_reader.frame
+            frame_rgb = np.flipud(np.rot90(frame[:, :, :]))
+            success, image_bytes = cv2.imencode(
+                ".jpg", cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            )
+            if success:
+                image_bytes = image_bytes.tobytes()
+
+                print(
+                    client.models.generate_content(
+                        model=model,
+                        contents=[
+                            types.Part.from_text(
+                                text="What can you see in this image? If you were a drone, how would you fly to the yellow bin? You can fly up down left right and yaw."
+                            ),
+                            types.Part.from_bytes(
+                                data=image_bytes, mime_type="image/jpeg"
+                            ),
+                        ],
+                        config=generate_content_config,
+                    ).text
+                )
+        while (
+            not self.emergency_triggered
+            and not self.land_triggered
+            and not self.takeoff_triggered
+            and not self.stop_threads.is_set()
+            and sum(
+                [
+                    self.forward_back_input,
+                    self.left_right_input,
+                    self.up_down_input,
+                    self.yaw_input,
+                ]
+            )
+            == 0
+        ):
+            try:
+
+                print(
+                    client.models.generate_content(
+                        model=model, contents=contents, config=generate_content_config
+                    )
+                )
+                # for chunk in client.models.generate_content_stream(
+                #     model=model,
+                #     contents=contents,
+                #     config=generate_content_config,
+                # ):
+                #     print(
+                #         chunk.text
+                #         if chunk.function_calls is None
+                #         else chunk.function_calls[0]
+                #     )
+
+                time.sleep(1)
+            except Exception as e:
+                print(f"Autopilot error: {e}")
+                break
+
     def drone_connection_worker(self):
         """Background thread to connect to the drone and set up video stream."""
         print("Drone connection thread started")
@@ -292,12 +393,7 @@ class TelloDroneController:
             try:
                 command = self.blocking_command_queue.get(timeout=0.1)
                 self.emergency_triggered = False
-
-                if command["type"] == "takeoff":
-                    self._execute_takeoff()
-                elif command["type"] == "land":
-                    self._execute_land()
-
+                command()
                 self.blocking_command_queue.task_done()
             except queue.Empty:
                 continue
@@ -305,35 +401,14 @@ class TelloDroneController:
                 print(f"Blocking command execution error: {e}")
         print("Blocking command thread stopped")
 
-    def _execute_takeoff(self):
-        """Execute takeoff in command thread."""
-        try:
-            print("Taking off...")
-            self.drone.takeoff()
-            print("Takeoff completed!")
-        except Exception as e:
-            print(f"Takeoff failed: {e}")
-        finally:
-            self.takeoff_triggered = False
-
-    def _execute_land(self):
-        """Execute landing in command thread."""
-        try:
-            print("Landing...")
-            self.drone.land()
-            print("Landing completed!")
-        except Exception as e:
-            print(f"Landing failed: {e}")
-        finally:
-            self.land_triggered = False
-
-    def queue_command(self, command_type):
+    def queue_command(self, command):
         """Queue a command for execution in the blocking command thread."""
-        command = {"type": command_type}
         try:
-            self.blocking_command_queue.put_nowait(command)
-        except queue.Full:
-            return
+            self.blocking_command_queue.get_nowait()  # Remove any pending command
+        except queue.Empty:
+            pass
+
+        self.blocking_command_queue.put(command)
 
     def draw_telemetry_overlay_pygame(self):
         """Draw telemetry overlay using pygame fonts."""
@@ -403,16 +478,6 @@ class TelloDroneController:
             emergency_text = font_status.render("EMERGENCY STOP", True, (255, 0, 0))
             rect = emergency_text.get_rect(center=(win_w // 2, win_h // 2))
             self.screen.blit(emergency_text, rect)
-
-        if self.takeoff_triggered:
-            takeoff_text = font_status.render("TAKEOFF", True, (255, 255, 255))
-            rect = takeoff_text.get_rect(center=(win_w // 2, win_h // 2 - 90))
-            self.screen.blit(takeoff_text, rect)
-
-        if self.land_triggered:
-            land_text = font_status.render("LAND", True, (255, 255, 255))
-            rect = land_text.get_rect(center=(win_w // 2, win_h // 2 + 90))
-            self.screen.blit(land_text, rect)
 
     def update_drone_controls(self):
         """Send control commands to drone (called from main thread)."""
