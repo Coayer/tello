@@ -4,10 +4,13 @@ import pygame
 import numpy as np
 import queue
 import time
+import argparse
 from google import genai
 from google.genai import types
 import os
-import cv2
+import io
+from PIL import Image
+import base64
 
 """
 Controls:
@@ -53,6 +56,7 @@ class TelloDroneController:
         }
 
         self.emergency_triggered = False
+        self.autopilot_running = False
         self.blocking_command_queue = queue.Queue(
             1
         )  # Limit to 1 command when pressing the button
@@ -110,6 +114,9 @@ class TelloDroneController:
             elif self.controller.get_button(4):
                 self.queue_command(self.drone.land)
 
+            elif self.controller.get_button(0):
+                self.queue_command(self.drone.rotate_clockwise(45))
+
             elif self.controller.get_hat(0) == (0, 1):
                 self.queue_command(self.drone.move_forward(MOVEMENT_DISTANCE))
 
@@ -122,11 +129,12 @@ class TelloDroneController:
             elif self.controller.get_hat(0) == (1, 0):
                 self.queue_command(self.drone.move_right(MOVEMENT_DISTANCE))
 
-            elif self.controller.get_button(2):
-                self.autopilot_worker_thread = threading.Thread(
-                    target=self.autopilot_worker, daemon=True
-                )
+            elif self.controller.get_button(2) and not self.autopilot_running:
+                self.autopilot_running = True
                 self.autopilot_worker_thread.start()
+
+            elif self.controller.get_button(1):
+                self.autopilot_running = False
 
             elif self.controller.get_button(8) or self.controller.get_button(10):
                 self.drone.emergency()
@@ -222,6 +230,9 @@ class TelloDroneController:
         self.drone_connection_thread = threading.Thread(
             target=self.drone_connection_worker, daemon=True
         )
+        self.autopilot_worker_thread = threading.Thread(
+            target=self.autopilot_worker, daemon=True
+        )
 
         self.telemetry_thread.start()
         self.blocking_command_thread.start()
@@ -230,49 +241,108 @@ class TelloDroneController:
 
         print("Background threads started")
 
-    def move(self):
-        print("hi")
+    def move(self, direction: str) -> None:
+        """Move the drone in the specified direction by a fixed distance.
+        direction: "forward", "backward", "left", "right", "up", "down"
+        """
+        match direction:
+            case "forward":
+                self.queue_command(self.drone.move_forward(MOVEMENT_DISTANCE))
+            case "backward":
+                self.queue_command(self.drone.move_back(MOVEMENT_DISTANCE))
+            case "left":
+                self.queue_command(self.drone.move_left(MOVEMENT_DISTANCE))
+            case "right":
+                self.queue_command(self.drone.move_right(MOVEMENT_DISTANCE))
+            case "up":
+                self.queue_command(self.drone.move_up(MOVEMENT_DISTANCE))
+            case "down":
+                self.queue_command(self.drone.move_down(MOVEMENT_DISTANCE))
+            case _:
+                print(f"Unknown move direction: {direction}")
+
+    def rotate_clockwise(self, degrees: int) -> None:
+        self.queue_command(self.drone.rotate_clockwise(degrees))
+
+    def rotate_anticlockwise(self, degrees: int) -> None:
+        self.queue_command(self.drone.rotate_counter_clockwise(degrees))
 
     def autopilot_worker(self):
         client = genai.Client(
             api_key=os.environ.get("GEMINI_API_KEY"),
         )
 
-        model = "gemini-2.5-flash"
-        tools = []
+        model = "gemini-2.5-flash-lite"
+
+        tools = [self.move, self.rotate_clockwise, self.rotate_anticlockwise]
+
         generate_content_config = types.GenerateContentConfig(
             tools=tools,
             thinking_config=types.ThinkingConfig(
                 thinking_budget=0,
             ),
         )
-        if self.frame_reader:
-            frame = self.frame_reader.frame
-            frame_rgb = np.flipud(np.rot90(frame[:, :, :]))
-            success, image_bytes = cv2.imencode(
-                ".jpg", cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            )
-            if success:
-                image_bytes = image_bytes.tobytes()
 
-                print(
-                    client.models.generate_content(
-                        model=model,
-                        contents=[
-                            types.Part.from_text(
-                                text="What can you see in this image? If you were a drone, how would you fly to the yellow bin? You can fly up down left right and yaw."
-                            ),
-                            types.Part.from_bytes(
-                                data=image_bytes, mime_type="image/jpeg"
-                            ),
-                        ],
-                        config=generate_content_config,
-                    ).text
-                )
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--prompt", "-p", help="autopilot instruction prompt")
+        args = parser.parse_args()
+
+        initial_prompt = f"""You are an AI pilot controlling a DJI Tello drone. Your task is to translate high-level user commands into a sequence of single flight maneuvers based on images from the drone's front-facing camera.
+
+Objective:
+Your primary goal is to successfully complete a sequence of tasks described in the user's command. You will do this by breaking down the command into smaller sub-goals and executing them in order.
+
+Available Functions:
+You can call one of the following functions at each step:
+move("forward"): Moves the drone forward 50cm.
+move("backward"): Moves the drone backward 50cm.
+move("left"): Moves the drone left 50cm.
+move("right"): Moves the drone right 50cm.
+rotate_clockwise(degrees): Rotates the drone clockwise by the specified number of degrees.
+rotate_anticlockwise(degrees): Rotates the drone counter-clockwise by the specified number of degrees.
+
+Input:
+At each step, you will receive:
+A single image from the drone's front-facing camera.
+The user's high-level command.
+
+Instructions:
+Deconstruct the Command: First, break down the user's command into a logical sequence of smaller, ordered sub-goals.
+Focus on One Sub-Goal at a Time: Address one sub-goal at a time. Do not proceed to the next sub-goal until the current one is verifiably complete based on the camera feed.
+Analyze the Image for the Current Sub-Goal: Carefully examine the image to identify the target object or direction for your current sub-goal and determine its position relative to the drone. If the image is garbled, do not proceed unless you can still see enough to make a safe decision.
+Correct for Drift: The drone may be affected by uncommanded drift. Before making a move towards the target, check if the drone is still correctly aligned. If the target for your current sub-goal is not centered, your first priority should be to rotate to face it directly.
+Decide on One Move: Based on your analysis, decide on the single best maneuver to make progress on the current sub-goal.
+Output: Your output should be a single function call and a very brief explanation of what you did and why.
+
+Example 1: Simple Command
+User Command: "Fly to the window."
+Sub-goals:
+    Find and fly to the window.
+Potential First Action (if window is to the right): rotate_clockwise(45)
+
+Example 2: Complex Command
+User Command: "turn left to face the window, fly up to it and out the door to your right"
+Sub-goals:
+    Turn left to find and face the window.
+    Fly towards the window.
+    Once near the window, locate the door to the right.
+    Turn to face the door.
+    Align with the center of the door frame.
+    Fly through the door.
+Initial Action for Sub-goal 1: The drone would start by executing rotate_anticlockwise(...) until the window is centered in its view. Only then would it move on to sub-goal 2.
+
+Here is your real task: {args.prompt}
+"""
+
+        chat = client.chats.create(model=model)
+        response = chat.send_message(initial_prompt)
+
+        if response.text:
+            print(f"Model acknowledged prompt: {response.text}")
+
         while (
-            not self.emergency_triggered
-            and not self.land_triggered
-            and not self.takeoff_triggered
+            self.autopilot_running
+            and not self.emergency_triggered
             and not self.stop_threads.is_set()
             and sum(
                 [
@@ -285,27 +355,28 @@ class TelloDroneController:
             == 0
         ):
             try:
+                frame = self.frame_reader.frame
+                in_mem_file = io.BytesIO()
+                img = Image.fromarray(frame[:, :, :])  # BGR to RGB
+                img.save(in_mem_file, format="JPEG")
+                in_mem_file.seek(0)
+                img_bytes = in_mem_file.read()
 
-                print(
-                    client.models.generate_content(
-                        model=model, contents=contents, config=generate_content_config
-                    )
+                response = chat.send_message(
+                    [
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                    ],
+                    config=generate_content_config,
                 )
-                # for chunk in client.models.generate_content_stream(
-                #     model=model,
-                #     contents=contents,
-                #     config=generate_content_config,
-                # ):
-                #     print(
-                #         chunk.text
-                #         if chunk.function_calls is None
-                #         else chunk.function_calls[0]
-                #     )
+                with open("tool_calls.log", "a") as f:
+                    f.write(f"{time.ctime()}: {response.text}\n")
 
-                time.sleep(1)
+                time.sleep(10)
             except Exception as e:
                 print(f"Autopilot error: {e}")
                 break
+
+        print("Autopilot finished")
 
     def drone_connection_worker(self):
         """Background thread to connect to the drone and set up video stream."""
@@ -478,6 +549,14 @@ class TelloDroneController:
             emergency_text = font_status.render("EMERGENCY STOP", True, (255, 0, 0))
             rect = emergency_text.get_rect(center=(win_w // 2, win_h // 2))
             self.screen.blit(emergency_text, rect)
+
+        # Center overlays
+        if self.autopilot_running:
+            autopilot_text = font_status.render(
+                "Autopilot Active", True, (255, 255, 255)
+            )
+            rect = autopilot_text.get_rect(center=(win_w // 2, win_h // 2))
+            self.screen.blit(autopilot_text, rect)
 
     def update_drone_controls(self):
         """Send control commands to drone (called from main thread)."""
